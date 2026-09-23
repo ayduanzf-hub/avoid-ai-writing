@@ -384,35 +384,71 @@ test('#123: unknown source modes fall back visibly to plain', () => {
 });
 
 test('#190: many HTML comments avoid quadratic rescanning', () => {
-  const count = 2000;
+  // 4000 keeps the small run (1000 comments) above the 20ms noise floor on a
+  // fast machine, so the floor cannot clamp the ratio down into a false pass:
+  // a linear masker reads ~4x here while a per-comment rescan reads ~13x.
+  const count = 4000;
   // Every comment contains the unmatched backtick that forced the old
   // implementation to rebuild whole-document code masks per comment.
-  const text = `${'<!-- ` -->\n'.repeat(count)}one two three four five six seven eight nine ten`;
-  const started = performance.now();
-  const result = AIDetector.analyzeText(text, { sourceMode: 'rendered-markdown' });
-  const elapsedMs = performance.now() - started;
+  const build = (comments) =>
+    `${'<!-- ` -->\n'.repeat(comments)}one two three four five six seven eight nine ten`;
+  // Ratio, not budget: a linear masker takes about 4x longer on 4x the
+  // comments, while the per-comment full rescan took about 16x. An absolute
+  // millisecond budget measured the runner's load instead of the masker's
+  // complexity, so it failed on slow machines (#208).
+  const timeFor = (comments) => {
+    const text = build(comments);
+    let best = Infinity;
+    for (let run = 0; run < 3; run += 1) {
+      const started = performance.now();
+      AIDetector.analyzeText(text, { sourceMode: 'rendered-markdown' });
+      best = Math.min(best, performance.now() - started);
+    }
+    return best;
+  };
 
+  const result = AIDetector.analyzeText(build(count), { sourceMode: 'rendered-markdown' });
   assert.equal(result.stats.maskedHtmlComments, count);
+
+  timeFor(count / 4); // warm the JIT before either measurement
+  const small = Math.max(timeFor(count / 4), 20);
+  const large = timeFor(count);
   assert.ok(
-    elapsedMs < 900,
-    `masking must not rescan the full document per comment (${elapsedMs.toFixed(1)}ms for ${count} comments)`,
+    large < small * 8,
+    `masking must not rescan the full document per comment: 4x comments took ${(large / small).toFixed(1)}x time (${small.toFixed(1)}ms vs ${large.toFixed(1)}ms)`,
   );
 });
 
 test('adversarial Markdown scans stay within a bounded time', () => {
   const ordinary = 'one two three four five six seven eight nine ten';
+  // Ratio, not budget (#208): every attack is measured at its base size and
+  // at 4x, so the assertion is about how the scan scales rather than about
+  // how loaded the runner happens to be.
   const attacks = [
-    `${ordinary} ${'`'.repeat(2500)}${'a'.repeat(2500)}`,
-    `${ordinary} ${'<a'.repeat(10000)}`,
-    `## 1.1.1${'\t'.repeat(20000)}— x\n${ordinary}`,
-    `## 1.1.${'1'.repeat(64000)}]x — 2026-01-01\n${ordinary}`,
-    `- ${' '.repeat(10000)}X\rY\n${ordinary}`,
+    ['unclosed code span', (n) => `${ordinary} ${'`'.repeat(n)}${'a'.repeat(n)}`, 2500],
+    ['unclosed anchor', (n) => `${ordinary} ${'<a'.repeat(n)}`, 10000],
+    ['heading tab run', (n) => `## 1.1.1${'\t'.repeat(n)}— x\n${ordinary}`, 20000],
+    ['long version digits', (n) => `## 1.1.${'1'.repeat(n)}]x — 2026-01-01\n${ordinary}`, 64000],
+    ['indented block run', (n) => `- ${' '.repeat(n)}X\rY\n${ordinary}`, 10000],
   ];
-  for (const text of attacks) {
-    const started = performance.now();
-    AIDetector.analyzeText(text);
-    const elapsedMs = performance.now() - started;
-    assert.ok(elapsedMs < 900, `adversarial scan took ${elapsedMs.toFixed(1)}ms`);
+  const timeFor = (build, n) => {
+    const text = build(n);
+    let best = Infinity;
+    for (let run = 0; run < 3; run += 1) {
+      const started = performance.now();
+      AIDetector.analyzeText(text);
+      best = Math.min(best, performance.now() - started);
+    }
+    return best;
+  };
+  for (const [name, build, base] of attacks) {
+    timeFor(build, base); // warm the JIT before either measurement
+    const small = Math.max(timeFor(build, base), 20);
+    const large = timeFor(build, base * 4);
+    assert.ok(
+      large < small * 8,
+      `${name}: 4x input took ${(large / small).toFixed(1)}x time (${small.toFixed(1)}ms vs ${large.toFixed(1)}ms)`,
+    );
   }
 });
 
@@ -938,16 +974,29 @@ test('#107: frontmatter, YAML, Markdown tables, and HTML attributes stay protect
 });
 
 test('#107: adversarial filename masking remains within a linear-time budget', () => {
+  const prefix = 'The generated identifier below has no filename extension and must remain safe to scan.';
   const attacks = [
-    `${'a-'.repeat(3000)}a`,
-    `${'segment/'.repeat(1000)}`,
+    ['hyphen run', (n) => `${prefix} ${'a-'.repeat(n)}a`, 750],
+    ['path segments', (n) => `${prefix} ${'segment/'.repeat(n)}`, 1000],
   ];
-  for (const attack of attacks) {
-    const text = `The generated identifier below has no filename extension and must remain safe to scan. ${attack}`;
-    const started = performance.now();
-    AIDetector.analyzeText(text);
-    const elapsedMs = performance.now() - started;
-    assert.ok(elapsedMs < 1000, `adversarial mask scan took ${elapsedMs.toFixed(1)}ms`);
+  const timeFor = (build, n) => {
+    const text = build(n);
+    let best = Infinity;
+    for (let run = 0; run < 3; run += 1) {
+      const started = performance.now();
+      AIDetector.analyzeText(text);
+      best = Math.min(best, performance.now() - started);
+    }
+    return best;
+  };
+  for (const [name, build, base] of attacks) {
+    timeFor(build, base); // warm the JIT before either measurement
+    const small = Math.max(timeFor(build, base), 20);
+    const large = timeFor(build, base * 4);
+    assert.ok(
+      large < small * 8,
+      `${name}: 4x input took ${(large / small).toFixed(1)}x time (${small.toFixed(1)}ms vs ${large.toFixed(1)}ms)`,
+    );
   }
 });
 
@@ -2529,13 +2578,30 @@ test('#189: direct normalization handles every occurrence and mapped analysis st
   assert.equal(normalized.text, 'xyz ex ey');
   assert.deepEqual(normalized.flags, { zeroWidth: 2, homoglyph: 2, roleplay: 0 });
 
-  const dense = '\u200b'.repeat(75000)
+  const denseCount = 75000;
+  const buildDense = (n) => '\u200b'.repeat(n)
     + 'Alpha beta gamma delta epsilon zeta eta theta iota kappa only time will tell about systems.';
-  const started = Date.now();
-  const denseResult = AIDetector.analyzeText(dense);
-  const elapsed = Date.now() - started;
-  assert.equal(denseResult.stats.normalization.zeroWidth, 75000);
-  assert.ok(elapsed < 1000, `dense mapped analysis took ${elapsed}ms; expected a linear pass under 1000ms`);
+  const timeFor = (n) => {
+    const text = buildDense(n);
+    let best = Infinity;
+    for (let run = 0; run < 3; run += 1) {
+      const started = performance.now();
+      AIDetector.analyzeText(text);
+      best = Math.min(best, performance.now() - started);
+    }
+    return best;
+  };
+
+  const denseResult = AIDetector.analyzeText(buildDense(denseCount));
+  assert.equal(denseResult.stats.normalization.zeroWidth, denseCount);
+
+  timeFor(denseCount); // warm the JIT before either measurement
+  const small = Math.max(timeFor(denseCount), 20);
+  const large = timeFor(denseCount * 4);
+  assert.ok(
+    large < small * 8,
+    `dense mapped analysis: 4x zero-width characters took ${(large / small).toFixed(1)}x time (${small.toFixed(1)}ms vs ${large.toFixed(1)}ms)`,
+  );
 });
 
 test('#189: ordinary unchanged text reports native indexes and exact slices', () => {
