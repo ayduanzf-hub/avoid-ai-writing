@@ -30,6 +30,33 @@ function test(name, fn) {
   }
 }
 
+/**
+ * Time `build(n)` at `base` and at 4x `base` (#208).
+ *
+ * Returns the best-of-three totals for an identical batch of scans at each
+ * size, so the assertion compares how the work scales rather than how fast the
+ * machine is. The batch is sized from the base input to lift both totals clear
+ * of timer noise; clamping the small total instead — as an earlier revision
+ * did — turns the ratio into a fixed millisecond allowance, and a quadratic
+ * regression then passes whenever the machine is fast enough to stay under it.
+ */
+function timeScaling(build, base, options) {
+  const measure = (n, batch) => {
+    const text = build(n);
+    let best = Infinity;
+    for (let run = 0; run < 3; run += 1) {
+      const started = performance.now();
+      for (let i = 0; i < batch; i += 1) AIDetector.analyzeText(text, options);
+      best = Math.min(best, performance.now() - started);
+    }
+    return best;
+  };
+
+  const single = Math.max(measure(base, 1), 0.05);
+  const batch = Math.min(2000, Math.max(1, Math.ceil(20 / single)));
+  return { small: measure(base, batch), large: measure(base * 4, batch), batch };
+}
+
 console.log('Detector fixtures');
 
 test('empty text returns Empty label', () => {
@@ -384,35 +411,20 @@ test('#123: unknown source modes fall back visibly to plain', () => {
 });
 
 test('#190: many HTML comments avoid quadratic rescanning', () => {
-  // 4000 keeps the small run (1000 comments) above the 20ms noise floor on a
-  // fast machine, so the floor cannot clamp the ratio down into a false pass:
-  // a linear masker reads ~4x here while a per-comment rescan reads ~13x.
+  // Ratio, not budget (#208): a linear masker takes about 4x longer on 4x the
+  // comments, while the per-comment full rescan this test exists to catch takes
+  // about 13x. An absolute millisecond budget measured the runner's load
+  // instead of the masker's complexity, so it failed on slow machines.
   const count = 4000;
   // Every comment contains the unmatched backtick that forced the old
   // implementation to rebuild whole-document code masks per comment.
   const build = (comments) =>
     `${'<!-- ` -->\n'.repeat(comments)}one two three four five six seven eight nine ten`;
-  // Ratio, not budget: a linear masker takes about 4x longer on 4x the
-  // comments, while the per-comment full rescan took about 16x. An absolute
-  // millisecond budget measured the runner's load instead of the masker's
-  // complexity, so it failed on slow machines (#208).
-  const timeFor = (comments) => {
-    const text = build(comments);
-    let best = Infinity;
-    for (let run = 0; run < 3; run += 1) {
-      const started = performance.now();
-      AIDetector.analyzeText(text, { sourceMode: 'rendered-markdown' });
-      best = Math.min(best, performance.now() - started);
-    }
-    return best;
-  };
 
   const result = AIDetector.analyzeText(build(count), { sourceMode: 'rendered-markdown' });
   assert.equal(result.stats.maskedHtmlComments, count);
 
-  timeFor(count / 4); // warm the JIT before either measurement
-  const small = Math.max(timeFor(count / 4), 20);
-  const large = timeFor(count);
+  const { small, large } = timeScaling(build, count / 4, { sourceMode: 'rendered-markdown' });
   assert.ok(
     large < small * 8,
     `masking must not rescan the full document per comment: 4x comments took ${(large / small).toFixed(1)}x time (${small.toFixed(1)}ms vs ${large.toFixed(1)}ms)`,
@@ -431,20 +443,8 @@ test('adversarial Markdown scans stay within a bounded time', () => {
     ['long version digits', (n) => `## 1.1.${'1'.repeat(n)}]x — 2026-01-01\n${ordinary}`, 64000],
     ['indented block run', (n) => `- ${' '.repeat(n)}X\rY\n${ordinary}`, 10000],
   ];
-  const timeFor = (build, n) => {
-    const text = build(n);
-    let best = Infinity;
-    for (let run = 0; run < 3; run += 1) {
-      const started = performance.now();
-      AIDetector.analyzeText(text);
-      best = Math.min(best, performance.now() - started);
-    }
-    return best;
-  };
   for (const [name, build, base] of attacks) {
-    timeFor(build, base); // warm the JIT before either measurement
-    const small = Math.max(timeFor(build, base), 20);
-    const large = timeFor(build, base * 4);
+    const { small, large } = timeScaling(build, base);
     assert.ok(
       large < small * 8,
       `${name}: 4x input took ${(large / small).toFixed(1)}x time (${small.toFixed(1)}ms vs ${large.toFixed(1)}ms)`,
@@ -979,20 +979,8 @@ test('#107: adversarial filename masking remains within a linear-time budget', (
     ['hyphen run', (n) => `${prefix} ${'a-'.repeat(n)}a`, 750],
     ['path segments', (n) => `${prefix} ${'segment/'.repeat(n)}`, 1000],
   ];
-  const timeFor = (build, n) => {
-    const text = build(n);
-    let best = Infinity;
-    for (let run = 0; run < 3; run += 1) {
-      const started = performance.now();
-      AIDetector.analyzeText(text);
-      best = Math.min(best, performance.now() - started);
-    }
-    return best;
-  };
   for (const [name, build, base] of attacks) {
-    timeFor(build, base); // warm the JIT before either measurement
-    const small = Math.max(timeFor(build, base), 20);
-    const large = timeFor(build, base * 4);
+    const { small, large } = timeScaling(build, base);
     assert.ok(
       large < small * 8,
       `${name}: 4x input took ${(large / small).toFixed(1)}x time (${small.toFixed(1)}ms vs ${large.toFixed(1)}ms)`,
@@ -2581,23 +2569,10 @@ test('#189: direct normalization handles every occurrence and mapped analysis st
   const denseCount = 75000;
   const buildDense = (n) => '\u200b'.repeat(n)
     + 'Alpha beta gamma delta epsilon zeta eta theta iota kappa only time will tell about systems.';
-  const timeFor = (n) => {
-    const text = buildDense(n);
-    let best = Infinity;
-    for (let run = 0; run < 3; run += 1) {
-      const started = performance.now();
-      AIDetector.analyzeText(text);
-      best = Math.min(best, performance.now() - started);
-    }
-    return best;
-  };
-
   const denseResult = AIDetector.analyzeText(buildDense(denseCount));
   assert.equal(denseResult.stats.normalization.zeroWidth, denseCount);
 
-  timeFor(denseCount); // warm the JIT before either measurement
-  const small = Math.max(timeFor(denseCount), 20);
-  const large = timeFor(denseCount * 4);
+  const { small, large } = timeScaling(buildDense, denseCount);
   assert.ok(
     large < small * 8,
     `dense mapped analysis: 4x zero-width characters took ${(large / small).toFixed(1)}x time (${small.toFixed(1)}ms vs ${large.toFixed(1)}ms)`,
